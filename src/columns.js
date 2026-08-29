@@ -25,53 +25,73 @@ const UNSEEN_WINDOW = config.needsYouWindowMinutes * 60;
 /// Does this session have a live pull request?
 const HAS_OPEN_PR = 's.pr && s.pr.state === "OPEN"';
 
+/// A session's directory is a linked git worktree — per-ticket by construction.
+const IN_WORKTREE = "s.project && s.project.worktree";
+/// It has written to a branch, i.e. it has actually touched code. Per-SESSION,
+/// unlike the checkout's current branch, which belongs to the folder.
+const TOUCHED_CODE = "s.touchedCode";
+const PLANNING = 's.stage === "planning"';
+
 const DEFAULT_COLUMNS = [
-  // ORDER IS DISPLAY ORDER — and, because `columnFor` takes the first match, it
-  // would also be match precedence. Those two wants disagree here: the board
-  // reads left-to-right coldest-to-hottest, but "PR Open" has to WIN over the
-  // other three (an open PR belongs in the PR column whatever else is true of
-  // it) while still being drawn last. So every rule is written MUTUALLY
-  // EXCLUSIVE — each of the first three excludes an open PR — which decouples
-  // precedence from position and makes the array safe to reorder for looks.
+  // What KIND of work each session is; the card's leading bar says whether it
+  // wants you (see `attentionFor`).
   //
-  // A card in the PR column still shows its underlying state through its dot
-  // colour (see `attentionFor`), so nothing is lost by moving it out of the
-  // column that colour names.
+  // "In Progress" used to be everything the ladder couldn't classify — its own
+  // positive signal, `writtenBranches`, is unreachable, since anything with a
+  // branch already has a PR by the time that rung is tested. So Building is
+  // defined by the signals that ARE present: the session sits in a git worktree
+  // (per-ticket by construction), or it has actually written to a branch. Those
+  // were briefly two columns; splitting them left In Progress permanently empty,
+  // because a session that writes code opens a PR shortly after and moves on.
+  // What's left is a conversation, which is what Scratch honestly is.
+  //
+  // Rules stay MUTUALLY EXCLUSIVE, which decouples match precedence from
+  // display order: "PR Open" must win over every other column while being drawn
+  // last, and Scratch must be a real complement rather than a catch-all.
   {
-    id: "idle",
-    label: "Idle",
-    color: "#6b7280",
-    rule: `!s.turnOpen && !s.blocked && !(s.unseen && s.ageSeconds < ${UNSEEN_WINDOW}) && !(${HAS_OPEN_PR})`,
-    compact: true,
-  },
-  {
-    id: "working",
-    label: "Working",
-    color: "#4ade80",
-    // Must exclude blocked: an ExitPlanMode session leaves the turn open, so
-    // without this it would read as Working while it waits on you.
-    rule: `s.turnOpen && !s.blocked && !(${HAS_OPEN_PR})`,
+    id: "scratch",
+    label: "Scratch",
+    color: "#8b929c",
+    // No PR, no worktree, not planning, never wrote code: a conversation.
+    rule: `!(${HAS_OPEN_PR}) && !(${IN_WORKTREE}) && !(${PLANNING}) && !(${TOUCHED_CODE})`,
     compact: false,
   },
   {
-    id: "needs-you",
-    label: "Needs You",
-    color: "#fbbf24",
-    // Blocked means genuinely stopped on a human: a pending question, a plan
-    // awaiting approval, or a PR with changes requested.
-    rule: `(s.blocked || (s.unseen && s.ageSeconds < ${UNSEEN_WINDOW})) && !(${HAS_OPEN_PR})`,
+    id: "planning",
+    label: "Planning",
+    color: "#c4b5fd",
+    rule: `!(${HAS_OPEN_PR}) && !(${IN_WORKTREE}) && ${PLANNING}`,
+    compact: false,
+  },
+  {
+    id: "building",
+    label: "In Worktree",
+    color: "#5eead4",
+    // Either signal counts: an isolated worktree, or code actually written.
+    rule: `!(${HAS_OPEN_PR}) && (${IN_WORKTREE} || (!(${PLANNING}) && ${TOUCHED_CODE}))`,
     compact: false,
   },
   {
     id: "pr-open",
     label: "PR Open",
     color: "#60a5fa",
-    // EVERY open PR, including one with changes requested — the card's dot
-    // says whether it needs you.
     rule: HAS_OPEN_PR,
     compact: false,
   },
 ];
+
+/// Dot colours by attention state. Their own palette now: with stage-based
+/// columns there is no "needs-you" COLUMN to borrow a colour from, and these
+/// three greys/greens/ambers are what the board has always used for idle,
+/// working and wants-you.
+export const ATTENTION_COLORS = {
+  "needs-you": "#fbbf24",
+  working: "#4ade80",
+  idle: "#6b7280",
+};
+
+/// Sort order within a column: wants-you first, then running, then quiet.
+export const ATTENTION_RANK = { "needs-you": 0, working: 1, idle: 2 };
 
 /**
  * Which attention state a session is in, ignoring its PR — i.e. the column it

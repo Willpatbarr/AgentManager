@@ -39,6 +39,10 @@ export const config = {
   // How often to ask GitHub for PR review state. Only runs when some session
   // actually has an open PR, and never inside the scan — see src/prs.js.
   prPollSeconds: Number(process.env.AM_PR_POLL_SEC ?? file.prPollSeconds ?? 600),
+  // How often to re-probe session directories for worktree-ness. A directory
+  // does not stop being a worktree, so this can be slow; new paths are probed
+  // immediately regardless.
+  worktreePollSeconds: Number(process.env.AM_WORKTREE_POLL_SEC ?? file.worktreePollSeconds ?? 300),
   // DeskDashboard push (leave unset to disable).
   piIngestUrl: process.env.AM_PI_INGEST_URL ?? file.piIngestUrl ?? null,
   piPushIntervalSeconds: Number(process.env.AM_PI_PUSH_SEC ?? file.piPushIntervalSeconds ?? 5),

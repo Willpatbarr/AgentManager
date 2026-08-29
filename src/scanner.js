@@ -3,7 +3,14 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { config } from "./config.js";
-import { attentionFor, columnDefs, columnFor } from "./columns.js";
+import { refreshWorktrees, worktreeInfo } from "./worktrees.js";
+import {
+  ATTENTION_COLORS,
+  ATTENTION_RANK,
+  attentionFor,
+  columnDefs,
+  columnFor,
+} from "./columns.js";
 import { analyzeTranscript, resolveTranscript } from "./transcript.js";
 import { primaryPullRequest, pullRequests, stageFor } from "./stage.js";
 import { refreshReviewStateIfStale, reviewStateFor } from "./prs.js";
@@ -127,6 +134,9 @@ export async function scanSessions() {
 
   const sessions = [];
   const openPrRepos = new Set();
+  // Directories to probe for worktree-ness: a session's own `cwd`, which for a
+  // worktree session is the worktree itself.
+  const probeCwds = [];
   for (const meta of readSessionMetadata(listSessionMetadataFiles())) {
     if (truthy(meta.isArchived)) continue;
 
@@ -201,8 +211,16 @@ export async function scanSessions() {
     };
     // Which column it lands in, and — separately — what it would be called if
     // the PR column didn't exist. The Pi paints the card's dot with the second.
+    if (meta.cwd) probeCwds.push(meta.cwd);
     session.state = columnFor(session);
     session.attention = attentionFor(session);
+    // Did this session actually write code? `writtenBranches` is per-SESSION,
+    // unlike the checkout's current branch (a property of the folder, shared by
+    // every session that ever ran there). It is the positive "implementing"
+    // signal the stage ladder never had — the ladder's own rule for it is
+    // unreachable, because anything with a branch also has a PR by then.
+    session.touchedCode = Array.isArray(meta.writtenBranches) && meta.writtenBranches.length > 0;
+    session.attentionColor = ATTENTION_COLORS[session.attention] ?? null;
     sessions.push(session);
   }
 
@@ -210,9 +228,19 @@ export async function scanSessions() {
   // Never awaited — one call takes ~1.5s and this loop runs every 2s.
   refreshReviewStateIfStale([...openPrRepos], now);
 
+  // Probe any new session directories for worktree-ness. Detached: the scan
+  // reads whatever the cache already holds (same contract as `prs.js`).
+  refreshWorktrees(probeCwds);
+
   const rank = new Map(columnDefs.map((c, i) => [c.id, i]));
+  // Column first, then ATTENTION — so a column reads hottest-first: the ones
+  // waiting on you, then the ones running, then the quiet ones — and recency
+  // inside each of those.
   sessions.sort(
-    (a, b) => (rank.get(a.state) ?? 99) - (rank.get(b.state) ?? 99) || b.lastActivityAt - a.lastActivityAt,
+    (a, b) =>
+      (rank.get(a.state) ?? 99) - (rank.get(b.state) ?? 99) ||
+      (ATTENTION_RANK[a.attention] ?? 9) - (ATTENTION_RANK[b.attention] ?? 9) ||
+      b.lastActivityAt - a.lastActivityAt,
   );
   return { updatedAt: now, columns: columnDefs, sessions };
 }
@@ -236,7 +264,13 @@ function projectFacet(meta, pr) {
     repo: pr?.repo ?? meta.prRepository ?? null,
     branch: meta.branch ?? null,
     base: meta.sourceBranch ?? pr?.base ?? null,
-    worktree: Boolean(meta.worktreePath),
+    // Git, not metadata: the desktop app never records `worktreePath` (0 of
+    // 215 files), but a session's own `cwd` tells git everything. `cwd` and
+    // not `originCwd` — the throwaway worktree directory IS the thing being
+    // asked about here, even though the label above wants the repo it came
+    // from. `exists: false` means the worktree has since been deleted.
+    worktree: worktreeInfo(meta.cwd ?? origin).isWorktree,
+    worktreeGone: worktreeInfo(meta.cwd ?? origin).exists === false,
   };
 }
 

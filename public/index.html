@@ -201,7 +201,7 @@ function render(data) {
     const el = document.getElementById(`col-${c.id}`);
     document.getElementById(`count-${c.id}`).textContent = byCol[c.id].length;
     el.innerHTML = byCol[c.id].length
-      ? byCol[c.id].map(s => cardHtml(s, c.color)).join("")
+      ? byCol[c.id].map(s => cardHtml(s, s.attentionColor ?? c.color)).join("")
       : `<div class="empty-col">—</div>`;
     for (const card of el.querySelectorAll(".card")) {
       card.addEventListener("click", () => focus(card.dataset.id, card.dataset.title));

@@ -29,6 +29,10 @@ export function startPiPush(getSnapshot) {
         model: s.model,
         state: s.state,
         attention: s.attention,
+        // Resolved on the session (scanner) so the API, the web board and the
+        // Pi all read one field — a stage-based board has no attention COLUMN
+        // for a client to look a colour up from.
+        attentionColor: s.attentionColor,
         stage: s.stage,
         stalled: s.stalled,
         // Retained alias; the Swift decoder reads this one today.
