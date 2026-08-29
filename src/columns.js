@@ -8,35 +8,87 @@ import { config } from "./config.js";
  *   rule   — JS expression over `s` (a session's raw signals); first match wins
  *   compact— render slim cards (no activity line) in this column
  *
- * Raw signals available to rules: s.turnOpen, s.askPending, s.stalled,
- * s.hasProcess, s.agents (array), s.ageSeconds, s.project, s.model, s.title.
+ * Attention signals available to rules: s.turnOpen, s.blocked, s.blockedOn,
+ * s.unseen, s.stalled, s.hasProcess, s.askPending (alias for blockedOn ===
+ * "question"), s.agents (array), s.ageSeconds.
+ * Descriptive: s.stage, s.project.{name,repo,branch,worktree}, s.pr.{number,
+ * state,reviewDecision,isDraft}, s.plan, s.model, s.effort, s.title.
  *
  * Override in config.json with { "columns": [ ... ] } (same shape, rule as a
- * string). A session matching no column lands in the last one.
+ * string). A session matching no column lands in the last one. The README
+ * documents a stage-based board (Planning/Implementing/In Review/Done) as a
+ * drop-in alternative to these attention-based defaults.
  */
+/// Seconds a finished-but-unlooked-at session still counts as wanting you.
+const UNSEEN_WINDOW = config.needsYouWindowMinutes * 60;
+
+/// Does this session have a live pull request?
+const HAS_OPEN_PR = 's.pr && s.pr.state === "OPEN"';
+
 const DEFAULT_COLUMNS = [
+  // ORDER IS DISPLAY ORDER — and, because `columnFor` takes the first match, it
+  // would also be match precedence. Those two wants disagree here: the board
+  // reads left-to-right coldest-to-hottest, but "PR Open" has to WIN over the
+  // other three (an open PR belongs in the PR column whatever else is true of
+  // it) while still being drawn last. So every rule is written MUTUALLY
+  // EXCLUSIVE — each of the first three excludes an open PR — which decouples
+  // precedence from position and makes the array safe to reorder for looks.
+  //
+  // A card in the PR column still shows its underlying state through its dot
+  // colour (see `attentionFor`), so nothing is lost by moving it out of the
+  // column that colour names.
+  {
+    id: "idle",
+    label: "Idle",
+    color: "#6b7280",
+    rule: `!s.turnOpen && !s.blocked && !(s.unseen && s.ageSeconds < ${UNSEEN_WINDOW}) && !(${HAS_OPEN_PR})`,
+    compact: true,
+  },
   {
     id: "working",
     label: "Working",
     color: "#4ade80",
-    rule: "s.turnOpen",
+    // Must exclude blocked: an ExitPlanMode session leaves the turn open, so
+    // without this it would read as Working while it waits on you.
+    rule: `s.turnOpen && !s.blocked && !(${HAS_OPEN_PR})`,
     compact: false,
   },
   {
     id: "needs-you",
     label: "Needs You",
     color: "#fbbf24",
-    rule: `s.askPending || (!s.turnOpen && s.ageSeconds < ${config.needsYouWindowMinutes * 60})`,
+    // Blocked means genuinely stopped on a human: a pending question, a plan
+    // awaiting approval, or a PR with changes requested.
+    rule: `(s.blocked || (s.unseen && s.ageSeconds < ${UNSEEN_WINDOW})) && !(${HAS_OPEN_PR})`,
     compact: false,
   },
   {
-    id: "idle",
-    label: "Idle",
-    color: "#6b7280",
-    rule: "true",
-    compact: true,
+    id: "pr-open",
+    label: "PR Open",
+    color: "#60a5fa",
+    // EVERY open PR, including one with changes requested — the card's dot
+    // says whether it needs you.
+    rule: HAS_OPEN_PR,
+    compact: false,
   },
 ];
+
+/**
+ * Which attention state a session is in, ignoring its PR — i.e. the column it
+ * would sit in if "PR Open" didn't exist. Cards carry this as a dot colour, so
+ * a PR-column card still shows at a glance whether it is running, waiting on
+ * you, or parked.
+ *
+ * Returns a column id, so the colour is looked up from the board's own columns
+ * rather than duplicated here.
+ */
+export function attentionFor(session) {
+  if (session.blocked || (session.unseen && session.ageSeconds < UNSEEN_WINDOW)) {
+    return "needs-you";
+  }
+  if (session.turnOpen) return "working";
+  return "idle";
+}
 
 function compile(defs) {
   return defs.map((def) => {

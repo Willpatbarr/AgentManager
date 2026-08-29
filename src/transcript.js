@@ -5,28 +5,55 @@ import { config } from "./config.js";
 const TAIL_BYTES = 512 * 1024;
 // Tool names that represent a spawned agent/workflow rather than a plain tool call.
 const AGENT_TOOLS = new Set(["Task", "Agent", "Workflow"]);
+/**
+ * Pending tool calls that mean the agent has stopped and is waiting on a human.
+ * `ExitPlanMode` matters as much as `AskUserQuestion`: it leaves the turn open,
+ * so without it a session awaiting plan approval reads as "Working" — the one
+ * state that most needs you is the one that used to hide.
+ */
+const BLOCKING_TOOLS = new Map([
+  ["ExitPlanMode", "plan"],
+  ["AskUserQuestion", "question"],
+]);
 
 /** Claude Code flattens a project cwd into a directory name by replacing / and . with -. */
 export function flattenCwd(cwd) {
   return cwd.replace(/[/.]/g, "-");
 }
 
-export function transcriptPathFor(cwd, cliSessionId) {
+/**
+ * Locate a session's transcript and read its mtime in the same stat that proves
+ * it exists. Returns `{ path, mtimeMs }`, or null when there's no transcript.
+ *
+ * Callers that only need to know *how old* a session is should use this rather
+ * than `analyzeTranscript` — the mtime is enough to age-gate a session, and it
+ * costs one stat instead of a 512 KB tail read plus a JSON parse per line.
+ */
+export function resolveTranscript(cwd, cliSessionId) {
+  const statOf = (p) => {
+    try {
+      return { path: p, mtimeMs: fs.statSync(p).mtimeMs };
+    } catch {
+      return null;
+    }
+  };
+
   if (cwd) {
-    const direct = path.join(config.projectsDir, flattenCwd(cwd), `${cliSessionId}.jsonl`);
-    if (fs.existsSync(direct)) return direct;
+    const direct = statOf(path.join(config.projectsDir, flattenCwd(cwd), `${cliSessionId}.jsonl`));
+    if (direct) return direct;
   }
   // Fallback: search every project dir (cwd may have changed mid-session).
   try {
     for (const dir of fs.readdirSync(config.projectsDir)) {
-      const p = path.join(config.projectsDir, dir, `${cliSessionId}.jsonl`);
-      if (fs.existsSync(p)) return p;
+      const found = statOf(path.join(config.projectsDir, dir, `${cliSessionId}.jsonl`));
+      if (found) return found;
     }
   } catch {
     /* projects dir missing */
   }
   return null;
 }
+
 
 function readTailRecords(file) {
   const stat = fs.statSync(file);
@@ -75,6 +102,8 @@ function describeToolUse(block) {
       return input.name || "workflow";
     case "AskUserQuestion":
       return "waiting on your answer";
+    case "ExitPlanMode":
+      return "waiting on plan approval";
     default:
       return block.name;
   }
@@ -117,8 +146,20 @@ export function analyzeTranscript(file) {
   let lastPrompt = null;
   let lastAssistantText = null;
   let lastToolUse = null;
+  let lastRecordAt = 0;
 
   for (const rec of records) {
+    // The real activity clock. Only genuine event records (user/assistant/
+    // system/attachment/queue-operation/pr-link) carry a timestamp; the
+    // trailing sidecars (last-prompt, ai-title, custom-title, mode) carry none
+    // and are rewritten merely by *opening* a session. That's why file mtime
+    // can't be trusted for activity, and why this max is taken over whatever
+    // records actually stamped themselves.
+    if (rec.timestamp !== undefined && rec.timestamp !== null) {
+      const at = typeof rec.timestamp === "number" ? rec.timestamp : Date.parse(rec.timestamp);
+      if (Number.isFinite(at) && at > lastRecordAt) lastRecordAt = at;
+    }
+
     switch (rec.type) {
       case "ai-title":
         aiTitle = rec.aiTitle ?? aiTitle;
@@ -155,7 +196,14 @@ export function analyzeTranscript(file) {
   }
 
   const pending = [...pendingToolUses.values()];
-  const askPending = pending.some((b) => b.name === "AskUserQuestion");
+  // What the agent is stopped on, if anything. "plan" outranks "question" so a
+  // session with both pending reports the heavier gate.
+  let blockedOn = null;
+  for (const b of pending) {
+    const reason = BLOCKING_TOOLS.get(b.name);
+    if (!reason) continue;
+    if (reason === "plan" || blockedOn === null) blockedOn = reason;
+  }
   const agents = pending
     .filter((b) => AGENT_TOOLS.has(b.name))
     .map((b) => ({ kind: b.name, label: describeToolUse(b) }));
@@ -179,8 +227,9 @@ export function analyzeTranscript(file) {
 
   return {
     mtimeMs,
+    lastRecordAt,
     turnOpen,
-    askPending,
+    blockedOn,
     agents,
     pendingToolCount: pending.length,
     lastActivity,

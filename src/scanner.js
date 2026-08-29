@@ -3,8 +3,10 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { config } from "./config.js";
-import { columnDefs, columnFor } from "./columns.js";
-import { analyzeTranscript, transcriptPathFor } from "./transcript.js";
+import { attentionFor, columnDefs, columnFor } from "./columns.js";
+import { analyzeTranscript, resolveTranscript } from "./transcript.js";
+import { primaryPullRequest, pullRequests, stageFor } from "./stage.js";
+import { refreshReviewStateIfStale, reviewStateFor } from "./prs.js";
 
 const execFileP = promisify(execFile);
 
@@ -40,76 +42,173 @@ function listSessionMetadataFiles() {
   return out;
 }
 
+/**
+ * Parsed `local_*.json` keyed by path, invalidated by mtime.
+ *
+ * These files are rewritten rarely but were re-read and re-parsed on every
+ * scan, which was the single largest cost in a scan. Entries are pruned when
+ * their file disappears so the cache can't outlive the sessions it describes.
+ * The parsed objects are shared across scans — treat them as read-only.
+ */
+const metadataCache = new Map();
+
+/** Parse every metadata file, reusing the previous parse when it hasn't changed. */
+function readSessionMetadata(files) {
+  const present = new Set(files);
+  for (const key of metadataCache.keys()) {
+    if (!present.has(key)) metadataCache.delete(key);
+  }
+
+  const metas = [];
+  for (const file of files) {
+    let mtimeMs;
+    try {
+      mtimeMs = fs.statSync(file).mtimeMs;
+    } catch {
+      metadataCache.delete(file);
+      continue;
+    }
+
+    const cached = metadataCache.get(file);
+    if (cached && cached.mtimeMs === mtimeMs) {
+      metas.push(cached.meta);
+      continue;
+    }
+
+    try {
+      const meta = JSON.parse(fs.readFileSync(file, "utf-8"));
+      metadataCache.set(file, { mtimeMs, meta });
+      metas.push(meta);
+    } catch {
+      metadataCache.delete(file);
+    }
+  }
+  return metas;
+}
+
 /** cliSessionIds that have a live claude process (via --resume=<id> on the command line). */
 async function liveCliSessionIds() {
   const resumed = new Set();
-  let liveProcessCount = 0;
   try {
     const { stdout } = await execFileP("ps", ["-axo", "command"], { maxBuffer: 8 * 1024 * 1024 });
     for (const line of stdout.split("\n")) {
       if (!line.includes("claude.app/Contents/MacOS/claude")) continue;
       if (line.includes("/Helpers/disclaimer ")) continue; // wrapper, child repeats the args
-      liveProcessCount++;
       const m = line.match(/--resume[= ]([0-9a-f-]{36})/);
       if (m) resumed.add(m[1]);
     }
   } catch {
     /* ps failed; fall back to activity-based liveness */
   }
-  return { resumed, liveProcessCount };
+  return resumed;
 }
 
 function truthy(v) {
   return v === true || v === "True" || v === "true";
 }
 
+/** Last `ps` result, reused until it ages past `config.processPollSeconds`. */
+let processLiveness = { checkedAt: 0, resumed: new Set() };
+
+/** Process liveness on its own cadence — see `config.processPollSeconds`. */
+async function resumedSessionIds(now) {
+  if (now - processLiveness.checkedAt < config.processPollSeconds * 1000) {
+    return processLiveness.resumed;
+  }
+  const resumed = await liveCliSessionIds();
+  processLiveness = { checkedAt: now, resumed };
+  return resumed;
+}
+
 export async function scanSessions() {
   const now = Date.now();
   const maxAgeMs = config.maxSessionAgeHours * 3600 * 1000;
-  const { resumed } = await liveCliSessionIds();
+  const resumed = await resumedSessionIds(now);
 
   const sessions = [];
-  for (const file of listSessionMetadataFiles()) {
-    let meta;
-    try {
-      meta = JSON.parse(fs.readFileSync(file, "utf-8"));
-    } catch {
-      continue;
-    }
+  const openPrRepos = new Set();
+  for (const meta of readSessionMetadata(listSessionMetadataFiles())) {
     if (truthy(meta.isArchived)) continue;
 
     const lastMetaActivity = Number(meta.lastActivityAt ?? 0);
     const cliId = meta.cliSessionId;
-    const transcript = cliId ? transcriptPathFor(meta.cwd, cliId) : null;
-    const analysis = transcript ? analyzeTranscript(transcript) : null;
+    const transcript = cliId ? resolveTranscript(meta.cwd, cliId) : null;
 
-    const lastActivityMs = Math.max(lastMetaActivity, analysis?.mtimeMs ?? 0);
-    if (!lastActivityMs || now - lastActivityMs > maxAgeMs) continue;
+    // Age-gate on the transcript's mtime *before* reading its contents. Most
+    // sessions on disk are far older than the board's window, and analyzing
+    // one costs a 512 KB tail read plus a JSON parse per line — work that was
+    // being thrown away by the age check immediately below it.
+    // mtime is a valid *upper* bound on activity — a file can't be touched
+    // before its content is written — so it still safely skips the 512 KB read
+    // for sessions that are definitely old. It is not an activity clock,
+    // though: opening a session rewrites its trailing sidecar records. The real
+    // gate runs below, once the transcript's own timestamps are available.
+    const mtimeBound = Math.max(lastMetaActivity, transcript?.mtimeMs ?? 0);
+    if (!mtimeBound || now - mtimeBound > maxAgeMs) continue;
 
-    const hasProcess = cliId ? resumed.has(cliId) : false;
-    const ageMs = now - lastActivityMs;
+    const analysis = transcript ? analyzeTranscript(transcript.path) : null;
 
-    // Raw signals; the column engine (src/columns.js) decides the lane.
+    // Re-gate on the *true* activity clock now that the transcript is parsed.
+    // The mtime gate above only proved this session might be recent; a session
+    // merely opened and never worked has a fresh mtime and an ancient last turn.
+    const lastActivityAt = Math.max(lastMetaActivity, analysis?.lastRecordAt ?? 0);
+    if (!lastActivityAt || now - lastActivityAt > maxAgeMs) continue;
+
+    const ageMs = now - lastActivityAt;
+    const turnOpen = analysis?.turnOpen ?? false;
+
+    const pr = pullRequestFacet(meta);
+    if (pr?.state === "OPEN" && pr.repo) openPrRepos.add(pr.repo);
+
+    // A pending question or plan approval outranks a review verdict: it's the
+    // more immediate gate, and the agent is literally stopped on it.
+    const blockedOn =
+      analysis?.blockedOn ?? (pr?.reviewDecision === "CHANGES_REQUESTED" ? "changes-requested" : null);
+
     const session = {
       id: meta.sessionId,
       cliSessionId: cliId ?? null,
       title:
         meta.title || analysis?.customTitle || analysis?.aiTitle || analysis?.lastPrompt || "Untitled",
-      project: folderLabel(meta, analysis),
-      cwd: meta.cwd ?? null,
-      model: meta.model ?? null,
-      turnOpen: analysis?.turnOpen ?? false,
-      stalled: (analysis?.turnOpen ?? false) && ageMs > config.stalledAfterSeconds * 1000,
-      hasProcess,
-      askPending: analysis?.askPending ?? false,
+      stage: stageFor(meta),
+
+      // Attention signals stay flat: column rules read these constantly, and
+      // `s.blocked` reads better than `s.attention.blocked`.
+      turnOpen,
+      blocked: blockedOn !== null,
+      blockedOn,
+      unseen: lastActivityAt > Number(meta.lastFocusedAt ?? 0),
+      stalled: turnOpen && ageMs > config.stalledAfterSeconds * 1000,
+      hasProcess: cliId ? resumed.has(cliId) : false,
+      // Derived alias, retained so the Pi's Swift decoder keeps working
+      // untouched (PushIngest.swift reads `askPending`).
+      askPending: blockedOn === "question",
+
+      // Descriptive facets.
+      project: projectFacet(meta, pr),
+      pr,
+      plan: planFacet(meta),
+
       agents: analysis?.agents ?? [],
+      model: meta.model ?? null,
+      effort: meta.effort ?? null,
+      permissionMode: meta.permissionMode ?? null,
+
       lastActivity: analysis?.lastActivity ?? null,
-      lastActivityAt: lastActivityMs,
+      lastActivityAt,
+      lastFocusedAt: Number(meta.lastFocusedAt ?? 0) || null,
       ageSeconds: Math.round(ageMs / 1000),
     };
+    // Which column it lands in, and — separately — what it would be called if
+    // the PR column didn't exist. The Pi paints the card's dot with the second.
     session.state = columnFor(session);
+    session.attention = attentionFor(session);
     sessions.push(session);
   }
+
+  // Out-of-band and lazy: no open PR anywhere means no `gh` process at all.
+  // Never awaited — one call takes ~1.5s and this loop runs every 2s.
+  refreshReviewStateIfStale([...openPrRepos], now);
 
   const rank = new Map(columnDefs.map((c, i) => [c.id, i]));
   sessions.sort(
@@ -118,13 +217,53 @@ export async function scanSessions() {
   return { updatedAt: now, columns: columnDefs, sessions };
 }
 
-function folderLabel(meta, analysis) {
-  const folders = Array.isArray(meta.userSelectedFolders) ? meta.userSelectedFolders : [];
-  const source = folders[0] ?? meta.cwd ?? null;
+/**
+ * Where the session's work lives.
+ *
+ * `originCwd` rather than `cwd`: a worktree session's `cwd` is the throwaway
+ * worktree directory, so it used to label itself `focused-clarke-68e02b`
+ * instead of the repo it's actually working on. (The previous implementation
+ * read `userSelectedFolders`, a key that appears in 0 of 215 metadata files —
+ * the branch was dead and its guard could never fire.)
+ */
+function projectFacet(meta, pr) {
+  const origin = meta.originCwd ?? meta.cwd ?? null;
+  // Sessions with no chosen folder run inside the app's own session dir.
+  const isInternal = origin ? origin.includes("Application Support/Claude") : true;
+  return {
+    name: origin && !isInternal ? path.basename(origin) : null,
+    path: origin,
+    repo: pr?.repo ?? meta.prRepository ?? null,
+    branch: meta.branch ?? null,
+    base: meta.sourceBranch ?? pr?.base ?? null,
+    worktree: Boolean(meta.worktreePath),
+  };
+}
+
+/** The PR this session is about, with GitHub review state merged in from the cache. */
+function pullRequestFacet(meta) {
+  const source = primaryPullRequest(meta);
   if (!source) return null;
-  // Sessions with no chosen folder run inside the app's internal session dir — not a real project.
-  if (source.includes("Application Support/Claude")) {
-    return folders.length ? path.basename(source) : null;
-  }
-  return path.basename(source);
+  const repo = source.repo ?? meta.prRepository ?? null;
+  const number = source.prNumber ?? null;
+  const review = reviewStateFor(repo, number);
+  return {
+    number,
+    url: source.url ?? null,
+    repo,
+    branch: source.branch ?? null,
+    base: source.baseRef ?? null,
+    state: source.state ?? null,
+    reviewDecision: review?.reviewDecision ?? null,
+    isDraft: review?.isDraft ?? false,
+  };
+}
+
+/** The plan document this session was started from, if any. */
+function planFacet(meta) {
+  if (!meta.planPath) return null;
+  return {
+    path: meta.planPath,
+    name: path.basename(String(meta.planPath)).replace(/\.[^.]+$/, ""),
+  };
 }

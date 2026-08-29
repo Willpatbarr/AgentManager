@@ -21,13 +21,24 @@ export function startPiPush(getSnapshot) {
       sessions: snap.sessions.map((s) => ({
         id: s.id,
         title: s.title,
-        project: s.project,
+        // Deliberately flattened to the name string. `s.project` is an object
+        // now, but the Pi's Swift decoder declares `project: String?` — handing
+        // it the facet would fail the decode for the WHOLE payload and blank
+        // the board. Stays flat until the Pi side lands.
+        project: s.project?.name ?? null,
         model: s.model,
         state: s.state,
+        attention: s.attention,
+        stage: s.stage,
         stalled: s.stalled,
+        // Retained alias; the Swift decoder reads this one today.
         askPending: s.askPending,
+        blockedOn: s.blockedOn,
+        branch: s.project?.branch ?? null,
+        prNumber: s.pr?.number ?? null,
+        prState: s.pr?.state ?? null,
+        prReviewDecision: s.pr?.reviewDecision ?? null,
         agentCount: s.agents.length,
-        agents: s.agents.map((a) => a.label).slice(0, 3),
         lastActivity: s.lastActivity,
         ageSeconds: s.ageSeconds,
       })),

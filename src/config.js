@@ -28,10 +28,17 @@ export const config = {
     process.env.AM_PROJECTS_DIR ?? file.projectsDir ?? path.join(os.homedir(), ".claude/projects"),
   // Sessions with no activity for this long are dropped from the board entirely.
   maxSessionAgeHours: Number(process.env.AM_MAX_AGE_HOURS ?? file.maxSessionAgeHours ?? 48),
-  // Turn-closed sessions older than this stop being "needs-you" and become "idle".
-  needsYouWindowMinutes: Number(process.env.AM_NEEDS_YOU_MIN ?? file.needsYouWindowMinutes ?? 60),
+  // Unseen-but-not-blocked sessions older than this stop being "needs-you".
+  needsYouWindowMinutes: Number(process.env.AM_NEEDS_YOU_MIN ?? file.needsYouWindowMinutes ?? 120),
   // Mid-turn sessions with no transcript writes for this long get the "stalled" flag.
   stalledAfterSeconds: Number(process.env.AM_STALLED_SEC ?? file.stalledAfterSeconds ?? 120),
+  // How often to re-run `ps` for process liveness. It costs ~60ms a spawn and
+  // only feeds `hasProcess`, which doesn't change moment to moment, so there's
+  // no reason to pay for it on every scan.
+  processPollSeconds: Number(process.env.AM_PROCESS_POLL_SEC ?? file.processPollSeconds ?? 15),
+  // How often to ask GitHub for PR review state. Only runs when some session
+  // actually has an open PR, and never inside the scan — see src/prs.js.
+  prPollSeconds: Number(process.env.AM_PR_POLL_SEC ?? file.prPollSeconds ?? 600),
   // DeskDashboard push (leave unset to disable).
   piIngestUrl: process.env.AM_PI_INGEST_URL ?? file.piIngestUrl ?? null,
   piPushIntervalSeconds: Number(process.env.AM_PI_PUSH_SEC ?? file.piPushIntervalSeconds ?? 5),

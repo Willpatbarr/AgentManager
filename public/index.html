@@ -64,7 +64,17 @@
   .chip { background: #262b33; border-radius: 6px; padding: 1px 7px; }
   .flag { font-weight: 600; }
   .flag.ask { color: var(--needs); }
+  .flag.plan { color: #c4b5fd; }
+  .flag.changes { color: #f87171; }
   .flag.stalled { color: var(--stalled); }
+  .chip.stage { text-transform: capitalize; }
+  .chip.stage.planning { background: #2a2440; color: #c4b5fd; }
+  .chip.stage.implementing { background: #1f3325; color: #86e0a3; }
+  .chip.stage.review { background: #3a3320; color: #fcd34d; }
+  .chip.stage.done { background: #262b33; color: #8b929c; }
+  .pr { border-radius: 6px; padding: 1px 7px; background: #262b33; color: #9aa3af; }
+  .pr.changes { background: #3a2222; color: #f87171; border: 1px solid #5c2f2f; font-weight: 600; }
+  .pr.draft { opacity: 0.65; }
   .activity {
     margin-top: 7px; color: var(--dim); font-size: 12.5px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -130,16 +140,28 @@ async function focus(id, title) {
   }
 }
 
+function prBadge(pr) {
+  if (!pr || pr.number === null) return "";
+  const changes = pr.reviewDecision === "CHANGES_REQUESTED";
+  const cls = `pr${changes ? " changes" : ""}${pr.isDraft ? " draft" : ""}`;
+  const suffix = changes ? " changes" : pr.isDraft ? " draft" : "";
+  return `<span class="${cls}" title="${esc(pr.url ?? "")}">#${esc(String(pr.number))}${suffix}</span>`;
+}
+
 function cardHtml(s, color) {
   const flags = [];
-  if (s.askPending) flags.push('<span class="flag ask">question waiting</span>');
+  if (s.blockedOn === "question") flags.push('<span class="flag ask">question waiting</span>');
+  if (s.blockedOn === "plan") flags.push('<span class="flag plan">plan approval</span>');
+  if (s.blockedOn === "changes-requested") flags.push('<span class="flag changes">changes requested</span>');
   if (s.stalled) flags.push('<span class="flag stalled">stalled?</span>');
   return `
   <div class="card${s.stalled ? " stalled" : ""}" style="border-left-color:${color}"
        data-id="${s.id}" data-title="${esc(s.title)}">
     <div class="title" title="${esc(s.title)}">${esc(s.title)}</div>
     <div class="meta">
-      ${s.project ? `<span class="chip">${esc(s.project)}</span>` : ""}
+      ${s.project?.name ? `<span class="chip">${esc(s.project.name)}</span>` : ""}
+      ${s.stage ? `<span class="chip stage ${s.stage}">${esc(s.stage)}</span>` : ""}
+      ${prBadge(s.pr)}
       ${s.model ? `<span class="chip">${esc(s.model.replace("claude-", ""))}</span>` : ""}
       <span>${ago(s.ageSeconds)}</span>
       ${flags.join("")}
