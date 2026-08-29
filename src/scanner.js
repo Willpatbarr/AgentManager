@@ -212,17 +212,22 @@ export async function scanSessions() {
       lastFocusedAt: Number(meta.lastFocusedAt ?? 0) || null,
       ageSeconds: Math.round(ageMs / 1000),
     };
-    // Which column it lands in, and — separately — what it would be called if
-    // the PR column didn't exist. The Pi paints the card's dot with the second.
     if (meta.cwd) probeCwds.push(meta.cwd);
-    session.state = columnFor(session);
-    session.attention = attentionFor(session);
     // Did this session actually write code? `writtenBranches` is per-SESSION,
     // unlike the checkout's current branch (a property of the folder, shared by
     // every session that ever ran there). It is the positive "implementing"
-    // signal the stage ladder never had — the ladder's own rule for it is
-    // unreachable, because anything with a branch also has a PR by then.
+    // signal the stage ladder never had.
+    //
+    // Assigned BEFORE `columnFor` reads it. It used to be set two lines after,
+    // so `s.touchedCode` was `undefined` for every rule evaluation and the
+    // signal could never fire — the "In Worktree" column was reachable only via
+    // `s.project.worktree`, and a session that had written code but wasn't in a
+    // worktree fell all the way through to Scratch.
     session.touchedCode = Array.isArray(meta.writtenBranches) && meta.writtenBranches.length > 0;
+    // Which column it lands in, and — separately — what it would be called if
+    // the PR column didn't exist. The Pi paints the card's dot with the second.
+    session.state = columnFor(session);
+    session.attention = attentionFor(session);
     session.attentionColor = ATTENTION_COLORS[session.attention] ?? null;
     sessions.push(session);
   }
@@ -282,19 +287,19 @@ function projectFacet(meta, pr) {
  *
  * Takes the desktop app's word for it. There WAS a guard here that dropped a PR
  * whose repo didn't match the session directory's origin remote, to stop a
- * session that had moved repos from advertising a stale PR (it had one live: a
- * session moved from MemberTools to AgentManager and kept showing MemberTools'
- * #2070).
+ * session that had moved repos from advertising a stale PR (it had one live:
+ * a session moved from MemberTools to AgentManager and kept showing
+ * MemberTools' #2070).
  *
  * It cost more than it caught. Opening a PR in a repo OTHER than the one the
  * session sits in is ordinary — a session working in DeskDashboard that opens a
  * PR against AgentManager is doing exactly that — and the guard silently
  * dropped those, so the session fell out of the PR column with nothing to say
- * why. `cwd` and `originCwd` are both the session's own directory, so neither
- * can tell "moved on" apart from "worked across two repos".
+ * why. `cwd` and `originCwd` are both the session's directory, so neither can
+ * distinguish "moved on" from "worked across two repos".
  *
- * A stale PR is visible and fixable (drop the folder in the desktop app); a PR
- * that vanishes for an unexplained reason is neither.
+ * A stale PR is visible and fixable (drop the folder in the desktop app); a
+ * PR that vanishes for an unexplained reason is neither.
  */
 function pullRequestFacet(meta) {
   const source = primaryPullRequest(meta);
