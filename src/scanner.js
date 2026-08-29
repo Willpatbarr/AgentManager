@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { config } from "./config.js";
-import { refreshWorktrees, worktreeInfo } from "./worktrees.js";
+import { refreshWorktrees, remotesFor, worktreeInfo } from "./worktrees.js";
 import {
   ATTENTION_COLORS,
   ATTENTION_RANK,
@@ -275,10 +275,29 @@ function projectFacet(meta, pr) {
 }
 
 /** The PR this session is about, with GitHub review state merged in from the cache. */
+/**
+ * `prs[]` accumulates for the life of a session and is never scoped to the
+ * directory the session is currently in, so a session that moves to another
+ * repo keeps advertising the PR it opened in the old one. (Seen live: a
+ * session moved from MemberTools to AgentManager and went on showing
+ * MemberTools' #2070, which put it in the PR column of a repo it had left.)
+ *
+ * `project.repo` can't catch that — it is DERIVED from the PR, so it always
+ * agrees with it. Git can: if the session's own directory has an origin remote
+ * and it isn't the PR's repo, the PR isn't this session's any more.
+ * An unprobed or non-git directory yields null and is left alone, so the guard
+ * only ever fires on a positive mismatch.
+ */
 function pullRequestFacet(meta) {
   const source = primaryPullRequest(meta);
   if (!source) return null;
   const repo = source.repo ?? meta.prRepository ?? null;
+  // Compared by repo NAME, not `owner/name`: a fork workflow legitimately has
+  // origin at `you/Thing` while the PR lives upstream at `org/Thing`, and those
+  // are the same project. A null means the directory hasn't been probed yet —
+  // only an actual answer may reject a PR.
+  const remotes = remotesFor(meta.cwd ?? meta.originCwd);
+  if (repo && remotes && !remotes.some((r) => sameProject(r, repo))) return null;
   const number = source.prNumber ?? null;
   const review = reviewStateFor(repo, number);
   return {
@@ -291,6 +310,11 @@ function pullRequestFacet(meta) {
     reviewDecision: review?.reviewDecision ?? null,
     isDraft: review?.isDraft ?? false,
   };
+}
+
+/** `owner/name` pairs that name the same project, fork owners aside. */
+function sameProject(a, b) {
+  return a.split("/").pop().toLowerCase() === b.split("/").pop().toLowerCase();
 }
 
 /** The plan document this session was started from, if any. */

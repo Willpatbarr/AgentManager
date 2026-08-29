@@ -22,7 +22,7 @@ import { config } from "./config.js";
 
 const execFileP = promisify(execFile);
 
-/** cwd -> { isWorktree, exists } */
+/** cwd -> { isWorktree, exists, repos } */
 const cache = new Map();
 let checkedAt = 0;
 let inFlight = null;
@@ -33,7 +33,40 @@ let inFlight = null;
  * worktree" rather than to an error.
  */
 export function worktreeInfo(cwd) {
-  return cache.get(cwd) ?? { isWorktree: false, exists: true };
+  return cache.get(cwd) ?? { isWorktree: false, exists: true, repos: [] };
+}
+
+/**
+ * Every GitHub repo this directory has a remote for, as `owner/name`, or NULL
+ * if the directory hasn't been probed yet. The nil-vs-empty distinction is
+ * load-bearing: "no remotes" is an answer, "not asked yet" is not, and only the
+ * former may be used to reject a PR.
+ *
+ * ALL remotes, not just `origin`: this repo's own MemberTools checkout has
+ * origin pointing at a personal FORK while its PRs live upstream at
+ * `ICS-Eng/...`, so an origin-only check rejects perfectly good PRs.
+ */
+export function remotesFor(cwd) {
+  const entry = cache.get(cwd);
+  return entry ? entry.repos : null;
+}
+
+/** `owner/name` from any of the URL forms git remotes come in. */
+export function parseRemote(url) {
+  if (!url) return null;
+  const m = url.match(/(?:github\.com[:/])([^/]+)\/([^\s]+?)(?:\.git)?$/);
+  return m ? `${m[1]}/${m[2]}` : null;
+}
+
+/** Every distinct `owner/name` in `git remote -v` output. */
+export function parseRemotes(text) {
+  const found = new Set();
+  for (const line of (text ?? "").split("\n")) {
+    const url = line.split(/\s+/)[1];
+    const repo = parseRemote(url);
+    if (repo) found.add(repo);
+  }
+  return [...found];
 }
 
 /**
@@ -55,23 +88,25 @@ export function refreshWorktrees(cwds) {
       try {
         if (!fs.existsSync(cwd)) {
           // A deleted worktree: the session's directory is simply gone.
-          cache.set(cwd, { isWorktree: false, exists: false });
+          cache.set(cwd, { isWorktree: false, exists: false, repos: [] });
           continue;
         }
         // A linked worktree's own git dir differs from the repo's common one;
         // in a normal checkout they are the same directory.
-        const [gitDir, commonDir] = await Promise.all([
+        const [gitDir, commonDir, origin] = await Promise.all([
           git(cwd, "rev-parse", "--absolute-git-dir"),
           git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"),
+          git(cwd, "remote", "-v").catch(() => ""),
         ]);
         cache.set(cwd, {
           isWorktree: Boolean(gitDir && commonDir && gitDir !== commonDir),
           exists: true,
+          repos: parseRemotes(origin),
         });
       } catch {
         // Not a repo, or git unavailable. Keeping any previous answer beats
         // clearing one on a transient failure.
-        if (!cache.has(cwd)) cache.set(cwd, { isWorktree: false, exists: true });
+        if (!cache.has(cwd)) cache.set(cwd, { isWorktree: false, exists: true, repos: [] });
       }
     }
     inFlight = null;
