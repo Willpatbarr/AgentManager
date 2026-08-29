@@ -200,6 +200,9 @@ export async function scanSessions() {
       plan: planFacet(meta),
 
       agents: analysis?.agents ?? [],
+      // The fuller history behind `agents`: finished runs as well as in-flight
+      // ones, for the Pi's session detail panel. `agents` stays "right now".
+      agentRuns: analysis?.agentRuns ?? [],
       model: meta.model ?? null,
       effort: meta.effort ?? null,
       permissionMode: meta.permissionMode ?? null,
