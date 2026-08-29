@@ -1,0 +1,13 @@
+{
+  "name": "agentmanager",
+  "version": "0.1.0",
+  "description": "Live dashboard + API for Claude Code sessions running on this Mac, with click-to-focus and DeskDashboard push.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
