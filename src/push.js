@@ -17,11 +17,12 @@ export function startPiPush(getSnapshot) {
     if (!snap) return;
     const body = {
       updatedAt: snap.updatedAt,
-      columns: snap.columns?.map(({ id, label }) => ({ id, label })),
+      columns: snap.columns?.map(({ id, label, color, compact }) => ({ id, label, color, compact })),
       sessions: snap.sessions.map((s) => ({
         id: s.id,
         title: s.title,
         project: s.project,
+        model: s.model,
         state: s.state,
         stalled: s.stalled,
         askPending: s.askPending,
