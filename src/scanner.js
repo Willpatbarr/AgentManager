@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { config } from "./config.js";
-import { refreshWorktrees, worktreeInfo } from "./worktrees.js";
+import { candidateRepos, refreshWorktrees, worktreeInfo } from "./worktrees.js";
 import {
   ATTENTION_COLORS,
   ATTENTION_RANK,
@@ -13,7 +13,7 @@ import {
 } from "./columns.js";
 import { analyzeTranscript, resolveTranscript } from "./transcript.js";
 import { primaryPullRequest, pullRequests, stageFor } from "./stage.js";
-import { refreshReviewStateIfStale, reviewStateFor } from "./prs.js";
+import { isYours, openPullRequestsFor, refreshReviewStateIfStale, reviewStateFor } from "./prs.js";
 
 const execFileP = promisify(execFile);
 
@@ -167,7 +167,14 @@ export async function scanSessions() {
     const ageMs = now - lastActivityAt;
     const turnOpen = analysis?.turnOpen ?? false;
 
-    const pr = pullRequestFacet(meta);
+    // Every repo this session could be working in, whether or not it has a PR
+    // we know about yet. Feeding these to the poll list is what BOOTSTRAPS
+    // discovery: a PR the desktop app never recorded lives in a repo nothing
+    // else would have asked GitHub about.
+    const searchable = candidateRepos(meta.cwd ?? meta.originCwd);
+    for (const repo of searchable) openPrRepos.add(repo);
+
+    const pr = pullRequestFacet(meta) ?? discoveredPullRequest(meta, searchable);
     if (pr?.state === "OPEN" && pr.repo) openPrRepos.add(pr.repo);
 
     // A pending question or plan approval outranks a review verdict: it's the
@@ -320,6 +327,72 @@ function pullRequestFacet(meta) {
 }
 
 /** The plan document this session was started from, if any. */
+/**
+ * A PR the desktop app never recorded, found by looking at the repos the
+ * session is actually sitting in.
+ *
+ * The app is the primary source and is usually right, but it does miss PRs —
+ * permanently, not just late — and a missed one drops the session out of the PR
+ * column with nothing to say why. This is the fallback, and only the fallback:
+ * it runs when `pullRequestFacet` came back empty.
+ *
+ * Matching is deliberately conservative, because a wrong attribution is worse
+ * than none — it would move somebody else's session into PR Open:
+ *
+ *   1. The PR's head branch is one this session actually wrote to. Exact, and
+ *      the only signal that is truly per-session — but `writtenBranches` is
+ *      frequently absent, which is why it cannot be the only rule.
+ *   2. The ticket in the session's title also appears in the PR's branch or
+ *      title. `LAM-3 backend work` matches branch `LAM-3-B`.
+ *
+ * Rule 2 is a heuristic and says so: two sessions on one ticket will both claim
+ * the PR. That is the honest reading — they ARE both working that ticket — and
+ * it beats neither of them showing it. A session whose title carries no ticket
+ * matches nothing rather than guessing.
+ */
+function discoveredPullRequest(meta, repos) {
+  if (!repos.length) return null;
+
+  const written = Array.isArray(meta.writtenBranches) ? meta.writtenBranches : [];
+  const ticket = ticketOf(meta.title);
+  if (!written.length && !ticket) return null;
+
+  for (const repo of repos) {
+    for (const pr of openPullRequestsFor(repo)) {
+      // Somebody else's PR in a shared repo is not this session's, however well
+      // the ticket matches. The repo listing is no longer filtered by author
+      // (see `prs.js`), so this is where ownership is decided.
+      if (!isYours(pr.author)) continue;
+      const branch = pr.headRefName ?? "";
+      const byBranch = branch && written.includes(branch);
+      const byTicket =
+        ticket &&
+        (branch.toUpperCase().includes(ticket) || (pr.title ?? "").toUpperCase().includes(ticket));
+      if (!byBranch && !byTicket) continue;
+
+      return {
+        number: pr.number,
+        url: pr.url ?? null,
+        repo,
+        branch: branch || null,
+        base: null,
+        // Only open PRs are cached, so anything found here is open by
+        // construction — this is what puts the session in the PR column.
+        state: "OPEN",
+        reviewDecision: pr.reviewDecision ?? null,
+        isDraft: Boolean(pr.isDraft),
+      };
+    }
+  }
+  return null;
+}
+
+/** The `ABC-123` ticket in a session title, uppercased, or null. */
+function ticketOf(title) {
+  const m = String(title ?? "").match(/\b[A-Za-z]{2,10}-\d+\b/);
+  return m ? m[0].toUpperCase() : null;
+}
+
 function planFacet(meta) {
   if (!meta.planPath) return null;
   return {
