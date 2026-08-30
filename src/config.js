@@ -49,6 +49,25 @@ export const config = {
   // How often to collect queued Pi taps (the Pi can't reach a firewalled Mac,
   // so taps ride this Mac-initiated poll).
   piFocusPollSeconds: Number(process.env.AM_PI_POLL_SEC ?? file.piFocusPollSeconds ?? 1.5),
+  // Which deep link a card tap sends. "hard" reaches the session (and reboots
+  // the web app on the way, closing torn-off windows — see README). "soft" is
+  // inert on Claude Desktop 1.24012.9: accepted without a warning, but the
+  // window never changes session, so every tap becomes a silent no-op. Hence
+  // OFF. Kept as a knob only because the routing is version-coupled and a
+  // future build may start honouring the route.
+  // Anything that isn't "soft" is coerced to "hard": a typo in an env var
+  // shouldn't turn every tap into a no-op.
+  focusLink: (process.env.AM_FOCUS_LINK ?? file.focusLink ?? "hard") === "soft" ? "soft" : "hard",
+  // Torn-off Claude windows are destroyed whenever the main window follows a
+  // session deep link, because that navigation reboots the renderer they are
+  // registered against — and nothing in the URL can prevent it (the in-place
+  // path depends on an internal per-webContents dispatcher no URL can conjure).
+  //
+  // Turning this ON makes a tap on some OTHER session skip the link rather than
+  // take your windows with it. **Off by default**: the only way to protect the
+  // windows is to not switch sessions, and losing click-to-focus is a worse
+  // trade than losing the windows. Set AM_PROTECT_POPOUTS=1 if you disagree.
+  protectPopouts: (process.env.AM_PROTECT_POPOUTS ?? file.protectPopouts ?? "0") === "1",
   // Optional board column overrides — see src/columns.js for the shape.
   columns: file.columns,
 };

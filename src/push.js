@@ -2,6 +2,22 @@ import { config } from "./config.js";
 import { focusSession } from "./focus.js";
 
 /**
+ * Shape version of the push body. **Bump this whenever a field is added to
+ * `body` below.**
+ *
+ * Deliberately a hand-bumped integer rather than a git SHA: the fact the Pi
+ * needs is "the push shape changed", and a SHA would false-alarm on every
+ * commit that never touched the wire. The Pi keeps its own copy of this number
+ * (`ClaudeSessionsReading.currentWireVersion`) and shows "OLD MAC" when the two
+ * disagree — the constants living in two repos and being able to disagree IS
+ * the signal, so don't try to share them.
+ *
+ * 2 — added the session detail fields (repo/base/worktree/prIsDraft/effort/
+ *     permissionMode/planName) and the `agents` list.
+ */
+const WIRE_VERSION = 2;
+
+/**
  * Producer loop: pushes the latest snapshot to the DeskDashboard ingest
  * endpoint on the Pi (same pattern as DeskDashboard's now-playing producer),
  * and polls the Pi's focus-tap queue. Taps flow Pi->Mac through that queue
@@ -28,6 +44,7 @@ export function startPiPush(getSnapshot) {
     if (!snap) return;
     const body = {
       updatedAt: snap.updatedAt,
+      wireVersion: WIRE_VERSION,
       columns: snap.columns?.map(({ id, label, color, compact }) => ({ id, label, color, compact })),
       sessions: snap.sessions.map((s) => ({
         id: s.id,
@@ -103,7 +120,12 @@ export function startPiPush(getSnapshot) {
       const { focus } = await res.json();
       for (const id of focus ?? []) {
         console.log(`[push] Pi tap -> focusing ${id}`);
-        focusSession(id).catch((err) => console.error(`[push] focus ${id} failed: ${err.message}`));
+        // Title rides along so an already-torn-off session is raised in its own
+        // window rather than reclaimed by the main one (src/focus.js).
+        const title = getSnapshot()?.sessions.find((s) => s.id === id)?.title ?? null;
+        focusSession(id, title).catch((err) =>
+          console.error(`[push] focus ${id} failed: ${err.message}`),
+        );
       }
     } catch (err) {
       if (process.env.AM_VERBOSE) console.error(`[push] queue poll: ${err.message}`);

@@ -5,6 +5,8 @@ import { config } from "./config.js";
 const TAIL_BYTES = 512 * 1024;
 // Tool names that represent a spawned agent/workflow rather than a plain tool call.
 const AGENT_TOOLS = new Set(["Task", "Agent", "Workflow"]);
+/** The same names quoted, for the cheap string pre-filter in `collectAgentRuns`. */
+const AGENT_TOOL_NAMES = [...AGENT_TOOLS].map((n) => `"${n}"`);
 /**
  * Most agent runs reported per session. A hard cap rather than a time window:
  * the detail panel on the Pi wants the recent history, but this rides a push
@@ -62,6 +64,121 @@ export function resolveTranscript(cwd, cliSessionId) {
 }
 
 
+/**
+ * Per-transcript agent-run history, keyed by file path:
+ * `{ offset, runs: Map<toolUseId, run> }`.
+ *
+ * Agent history CANNOT come from the tail. The tail is a fixed 512 KB window,
+ * and a `Task` whose `tool_use` record has scrolled out of it is invisible —
+ * measured across the real store, most sessions with subagents had **zero** of
+ * them left in the window (a 7.4 MB transcript kept none), so the detail panel
+ * showed "none this session" for sessions that had plainly run agents.
+ *
+ * A transcript is append-only, so the fix is a cursor rather than a bigger
+ * window: read the whole file once, then only the bytes appended since. The
+ * one-time backfill is what makes old runs appear at all; the incremental read
+ * is what keeps this affordable inside a scan that fires every 2s.
+ */
+const agentHistory = new Map();
+/** Ceiling on cached transcripts, so a long-lived daemon can't grow unbounded. */
+const MAX_HISTORY_FILES = 250;
+/** Runs retained per transcript. Above `MAX_AGENT_RUNS` so a late `tool_result` can still close a run that won't be shown. */
+const MAX_RUNS_CACHED = 120;
+
+/** The record's own timestamp, or null — see the activity-clock note below. */
+function recordTimestamp(rec) {
+  if (rec?.timestamp === undefined || rec?.timestamp === null) return null;
+  const at = typeof rec.timestamp === "number" ? rec.timestamp : Date.parse(rec.timestamp);
+  return Number.isFinite(at) ? at : null;
+}
+
+/**
+ * Every agent run in the WHOLE transcript, oldest first, reading only the bytes
+ * appended since last call.
+ *
+ * Lines are pre-filtered with plain string tests before `JSON.parse`, because
+ * the backfill pass would otherwise parse every record of every transcript on
+ * the first scan. Only two kinds of line matter: an agent `tool_use`, and a
+ * `tool_result` naming an agent id already seen in this file.
+ */
+function collectAgentRuns(file, size) {
+  let entry = agentHistory.get(file);
+  // A file smaller than our cursor was truncated or replaced — start over.
+  if (!entry || size < entry.offset) {
+    entry = { offset: 0, runs: new Map() };
+    if (agentHistory.size >= MAX_HISTORY_FILES) {
+      agentHistory.delete(agentHistory.keys().next().value);
+    }
+    agentHistory.set(file, entry);
+  }
+  if (size <= entry.offset) return entry.runs;
+
+  const fd = fs.openSync(file, "r");
+  let buf;
+  try {
+    buf = Buffer.alloc(size - entry.offset);
+    fs.readSync(fd, buf, 0, buf.length, entry.offset);
+  } finally {
+    fs.closeSync(fd);
+  }
+
+  // Stop at the last complete line and resume there next time, so a record
+  // caught mid-write is re-read whole rather than dropped as unparseable.
+  const lastNewline = buf.lastIndexOf(0x0a);
+  if (lastNewline === -1) return entry.runs;
+  const text = buf.subarray(0, lastNewline + 1).toString("utf-8");
+  entry.offset += lastNewline + 1;
+
+  for (const line of text.split("\n")) {
+    if (!line) continue;
+    const isUse = line.includes('"tool_use"') && AGENT_TOOL_NAMES.some((n) => line.includes(n));
+    // Only worth parsing if it closes a run we already know about.
+    const isResult =
+      !isUse &&
+      line.includes('"tool_result"') &&
+      entry.runs.size > 0 &&
+      [...entry.runs.keys()].some((id) => line.includes(id));
+    if (!isUse && !isResult) continue;
+
+    let rec;
+    try {
+      rec = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const recordAt = recordTimestamp(rec);
+
+    if (rec.type === "assistant") {
+      for (const b of contentBlocks(rec)) {
+        if (b.type !== "tool_use" || !AGENT_TOOLS.has(b.name)) continue;
+        entry.runs.set(b.id, {
+          kind: b.name,
+          label: describeToolUse(b),
+          agentType: b.input?.subagent_type ?? null,
+          model: b.input?.model ?? null,
+          startedAt: recordAt,
+          endedAt: null,
+          failed: false,
+        });
+      }
+    } else if (rec.type === "user") {
+      for (const b of contentBlocks(rec)) {
+        if (b.type !== "tool_result") continue;
+        const run = entry.runs.get(b.tool_use_id);
+        if (!run) continue;
+        run.endedAt = recordAt;
+        run.failed = b.is_error === true;
+      }
+    }
+  }
+
+  // Drop the oldest once over the cap; Map preserves insertion order.
+  while (entry.runs.size > MAX_RUNS_CACHED) {
+    entry.runs.delete(entry.runs.keys().next().value);
+  }
+  return entry.runs;
+}
+
 function readTailRecords(file) {
   const stat = fs.statSync(file);
   const start = Math.max(0, stat.size - TAIL_BYTES);
@@ -85,7 +202,7 @@ function readTailRecords(file) {
       /* clipped/partial line */
     }
   }
-  return { records, mtimeMs: stat.mtimeMs };
+  return { records, mtimeMs: stat.mtimeMs, size: stat.size };
 }
 
 function contentBlocks(rec) {
@@ -143,17 +260,16 @@ export function analyzeTranscript(file) {
   } catch {
     return null;
   }
-  const { records, mtimeMs } = tail;
+  const { records, mtimeMs, size } = tail;
 
   const pendingToolUses = new Map(); // tool_use id -> block
   /**
-   * Every agent this session spawned in the tail, keyed by tool_use id — and
-   * NEVER deleted from, which is the whole point of it being separate from
-   * `pendingToolUses`. `agents` below derives from what is still pending, so an
-   * agent vanishes from it the moment it returns; the detail panel wants the
-   * ones that finished just as much as the ones still running.
+   * Every agent this session ever spawned, oldest first — read from the whole
+   * file via a cursor, NOT from the tail. `agents` below derives from what is
+   * still pending, so an agent vanishes from it the moment it returns; the
+   * detail panel wants the ones that finished just as much as the live ones.
    */
-  const agentRuns = new Map();
+  const agentRuns = collectAgentRuns(file, size);
   let lastAssistantStop = null;
   let lastMeaningful = null; // last user/assistant record
   let aiTitle = null;
@@ -170,14 +286,8 @@ export function analyzeTranscript(file) {
     // and are rewritten merely by *opening* a session. That's why file mtime
     // can't be trusted for activity, and why this max is taken over whatever
     // records actually stamped themselves.
-    let recordAt = null;
-    if (rec.timestamp !== undefined && rec.timestamp !== null) {
-      const at = typeof rec.timestamp === "number" ? rec.timestamp : Date.parse(rec.timestamp);
-      if (Number.isFinite(at)) {
-        recordAt = at;
-        if (at > lastRecordAt) lastRecordAt = at;
-      }
-    }
+    const recordAt = recordTimestamp(rec);
+    if (recordAt !== null && recordAt > lastRecordAt) lastRecordAt = recordAt;
 
     switch (rec.type) {
       case "ai-title":
@@ -198,17 +308,6 @@ export function analyzeTranscript(file) {
           if (b.type === "tool_use") {
             pendingToolUses.set(b.id, b);
             lastToolUse = b;
-            if (AGENT_TOOLS.has(b.name)) {
-              agentRuns.set(b.id, {
-                kind: b.name,
-                label: describeToolUse(b),
-                agentType: b.input?.subagent_type ?? null,
-                model: b.input?.model ?? null,
-                startedAt: recordAt,
-                endedAt: null,
-                failed: false,
-              });
-            }
           }
         }
         break;
@@ -217,13 +316,9 @@ export function analyzeTranscript(file) {
         lastMeaningful = rec;
         for (const b of contentBlocks(rec)) {
           if (b.type !== "tool_result") continue;
+          // Agent runs are closed by `collectAgentRuns`, which sees the whole
+          // file; this loop only tracks what is still in flight.
           pendingToolUses.delete(b.tool_use_id);
-          // The same block closes an agent run, when it's an agent's result.
-          const run = agentRuns.get(b.tool_use_id);
-          if (run) {
-            run.endedAt = recordAt;
-            run.failed = b.is_error === true;
-          }
         }
         break;
       }
