@@ -28,7 +28,10 @@ export function startServer(getSnapshot) {
         res.end(JSON.stringify({ ok: true }));
       } else if (req.method === "POST" && FOCUS_PATH.test(url.pathname)) {
         const id = url.pathname.match(FOCUS_PATH)[1];
-        await focusSession(id);
+        // Title comes along so focus can spot a session that is already torn
+        // off into its own window — see `raisePopout` in src/focus.js.
+        const title = getSnapshot()?.sessions.find((s) => s.id === id)?.title ?? null;
+        await focusSession(id, title);
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true, focused: id }));
       } else {

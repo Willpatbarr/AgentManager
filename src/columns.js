@@ -101,12 +101,30 @@ export const ATTENTION_RANK = { "needs-you": 0, working: 1, idle: 2 };
  *
  * Returns a column id, so the colour is looked up from the board's own columns
  * rather than duplicated here.
+ *
+ * The branch ORDER is load-bearing, not incidental:
+ *   1. stopped ON you (pending plan/question) — beats a live turn, because
+ *      those keep `turnOpen` true while the agent waits on a human;
+ *   2. running right now (`turnOpen`);
+ *   3. finished and unseen, or a review verdict is waiting;
+ *   4. idle.
  */
 export function attentionFor(session) {
+  // Stopped ON you: a pending AskUserQuestion/ExitPlanMode keeps the turn
+  // technically open, so this has to outrank `turnOpen` below.
+  if (session.blockedOn === "plan" || session.blockedOn === "question") return "needs-you";
+  // Running right now. This must come BEFORE `unseen`: a working agent writes
+  // transcript records continuously, so lastActivityAt always outruns the
+  // frozen lastFocusedAt and `unseen` is true for the WHOLE turn — which used
+  // to swallow every running session into "needs-you" and made green
+  // unreachable except on sessions that were effectively dead.
+  if (session.turnOpen) return "working";
+  // Finished, and you haven't looked since — or a review verdict is waiting.
+  // `blocked` covers changes-requested, which is a PR fact rather than an agent
+  // stop, so it deliberately does NOT preempt green above.
   if (session.blocked || (session.unseen && session.ageSeconds < UNSEEN_WINDOW)) {
     return "needs-you";
   }
-  if (session.turnOpen) return "working";
   return "idle";
 }
 
