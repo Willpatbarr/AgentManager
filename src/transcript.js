@@ -6,6 +6,13 @@ const TAIL_BYTES = 512 * 1024;
 // Tool names that represent a spawned agent/workflow rather than a plain tool call.
 const AGENT_TOOLS = new Set(["Task", "Agent", "Workflow"]);
 /**
+ * Most agent runs reported per session. A hard cap rather than a time window:
+ * the detail panel on the Pi wants the recent history, but this rides a push
+ * that fires every few seconds, and a long-running session can spawn agents
+ * without limit. Newest-first, so the cap drops the oldest.
+ */
+const MAX_AGENT_RUNS = 40;
+/**
  * Pending tool calls that mean the agent has stopped and is waiting on a human.
  * `ExitPlanMode` matters as much as `AskUserQuestion`: it leaves the turn open,
  * so without it a session awaiting plan approval reads as "Working" — the one
@@ -139,6 +146,14 @@ export function analyzeTranscript(file) {
   const { records, mtimeMs } = tail;
 
   const pendingToolUses = new Map(); // tool_use id -> block
+  /**
+   * Every agent this session spawned in the tail, keyed by tool_use id — and
+   * NEVER deleted from, which is the whole point of it being separate from
+   * `pendingToolUses`. `agents` below derives from what is still pending, so an
+   * agent vanishes from it the moment it returns; the detail panel wants the
+   * ones that finished just as much as the ones still running.
+   */
+  const agentRuns = new Map();
   let lastAssistantStop = null;
   let lastMeaningful = null; // last user/assistant record
   let aiTitle = null;
@@ -155,9 +170,13 @@ export function analyzeTranscript(file) {
     // and are rewritten merely by *opening* a session. That's why file mtime
     // can't be trusted for activity, and why this max is taken over whatever
     // records actually stamped themselves.
+    let recordAt = null;
     if (rec.timestamp !== undefined && rec.timestamp !== null) {
       const at = typeof rec.timestamp === "number" ? rec.timestamp : Date.parse(rec.timestamp);
-      if (Number.isFinite(at) && at > lastRecordAt) lastRecordAt = at;
+      if (Number.isFinite(at)) {
+        recordAt = at;
+        if (at > lastRecordAt) lastRecordAt = at;
+      }
     }
 
     switch (rec.type) {
@@ -179,6 +198,17 @@ export function analyzeTranscript(file) {
           if (b.type === "tool_use") {
             pendingToolUses.set(b.id, b);
             lastToolUse = b;
+            if (AGENT_TOOLS.has(b.name)) {
+              agentRuns.set(b.id, {
+                kind: b.name,
+                label: describeToolUse(b),
+                agentType: b.input?.subagent_type ?? null,
+                model: b.input?.model ?? null,
+                startedAt: recordAt,
+                endedAt: null,
+                failed: false,
+              });
+            }
           }
         }
         break;
@@ -186,7 +216,14 @@ export function analyzeTranscript(file) {
       case "user": {
         lastMeaningful = rec;
         for (const b of contentBlocks(rec)) {
-          if (b.type === "tool_result") pendingToolUses.delete(b.tool_use_id);
+          if (b.type !== "tool_result") continue;
+          pendingToolUses.delete(b.tool_use_id);
+          // The same block closes an agent run, when it's an agent's result.
+          const run = agentRuns.get(b.tool_use_id);
+          if (run) {
+            run.endedAt = recordAt;
+            run.failed = b.is_error === true;
+          }
         }
         break;
       }
@@ -231,6 +268,10 @@ export function analyzeTranscript(file) {
     turnOpen,
     blockedOn,
     agents,
+    // Newest first, so `MAX_AGENT_RUNS` drops the oldest rather than the ones
+    // you'd actually want to look at. Unlike `agents`, these include runs that
+    // have already finished.
+    agentRuns: [...agentRuns.values()].reverse().slice(0, MAX_AGENT_RUNS),
     pendingToolCount: pending.length,
     lastActivity,
     aiTitle,

@@ -19,7 +19,7 @@ import { config } from "./config.js";
 
 const execFileP = promisify(execFile);
 
-/** repo -> Map<prNumber, { reviewDecision, isDraft }> */
+/** repo -> Map<prNumber, { reviewDecision, isDraft, headRefName, title, url, author }> */
 const reviewState = new Map();
 let checkedAt = 0;
 let inFlight = null;
@@ -31,6 +31,21 @@ let inFlight = null;
 export function reviewStateFor(repo, number) {
   if (!repo || number === null || number === undefined) return null;
   return reviewState.get(repo)?.get(Number(number)) ?? null;
+}
+
+/**
+ * Every open PR of yours in `repo`, as `{ number, headRefName, title, url,
+ * reviewDecision, isDraft }`. A pure cache read.
+ *
+ * These records were already being fetched and thrown away — the query below
+ * has always listed your open PRs, and only the review fields were kept. They
+ * are the raw material for attributing a PR to a session the desktop app never
+ * recorded one for; see `discoveredPullRequest` in `scanner.js`.
+ */
+export function openPullRequestsFor(repo) {
+  const byNumber = reviewState.get(repo);
+  if (!byNumber) return [];
+  return [...byNumber.entries()].map(([number, pr]) => ({ number, ...pr }));
 }
 
 /**
@@ -51,16 +66,49 @@ export function refreshReviewStateIfStale(repos, now = Date.now()) {
     });
 }
 
+/**
+ * Every GitHub login this machine is signed in as, lowercased.
+ *
+ * Read once from `gh auth status`, which lists ALL logged-in accounts rather
+ * than just the active one. Empty when it can't be read — and `isYours` then
+ * accepts everything, so a parsing failure degrades to the old behaviour of
+ * trusting the repo listing rather than to attributing nothing.
+ */
+let logins = null;
+
+async function knownLogins() {
+  if (logins) return logins;
+  try {
+    const { stdout } = await execFileP("gh", ["auth", "status"], { timeout: 10_000 });
+    logins = new Set([...stdout.matchAll(/account (\S+)/g)].map((m) => m[1].toLowerCase()));
+  } catch {
+    logins = new Set();
+  }
+  return logins;
+}
+
+/** Whether a PR was opened by one of this machine's accounts. */
+export function isYours(author) {
+  if (!logins || !logins.size) return true;
+  return logins.has(String(author ?? "").toLowerCase());
+}
+
 async function fetchRepoReviewState(repo) {
+  await knownLogins();
   try {
     const { stdout } = await execFileP(
       "gh",
       [
         "pr", "list",
         "--repo", repo,
-        "--author", "@me",
+        // NOT `--author @me`. That resolves against whichever account `gh` is
+        // currently switched to, so on a machine with a work login and a
+        // personal one it silently hides every PR opened by the other — which
+        // made changes-requested invisible on half this user's repos and left
+        // `openPullRequestsFor` empty for them. Ownership is decided by
+        // `isYours` against every logged-in account instead.
         "--state", "open",
-        "--json", "number,reviewDecision,isDraft",
+        "--json", "number,reviewDecision,isDraft,headRefName,title,url,author",
         "--limit", "100",
       ],
       { timeout: 20_000, maxBuffer: 4 * 1024 * 1024 },
@@ -71,6 +119,10 @@ async function fetchRepoReviewState(repo) {
       next.set(Number(pr.number), {
         reviewDecision: pr.reviewDecision || null,
         isDraft: Boolean(pr.isDraft),
+        headRefName: pr.headRefName || null,
+        title: pr.title || null,
+        url: pr.url || null,
+        author: pr.author?.login || null,
       });
     }
     reviewState.set(repo, next);

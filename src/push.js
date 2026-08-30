@@ -9,6 +9,17 @@ import { focusSession } from "./focus.js";
  * reach the Pi, so both directions ride Mac-initiated requests.
  * No-op unless AM_PI_INGEST_URL / config.piIngestUrl is set.
  */
+/**
+ * How long an agent run has been going, or how long it took. Null when the
+ * transcript record carried no timestamp to measure from — the Pi renders the
+ * agent without a duration rather than showing a made-up one.
+ */
+function agentSeconds(run) {
+  if (!run.startedAt) return null;
+  const end = run.endedAt ?? Date.now();
+  return Math.max(0, Math.round((end - run.startedAt) / 1000));
+}
+
 export function startPiPush(getSnapshot) {
   if (!config.piIngestUrl) return null;
 
@@ -42,9 +53,33 @@ export function startPiPush(getSnapshot) {
         prNumber: s.pr?.number ?? null,
         prState: s.pr?.state ?? null,
         prReviewDecision: s.pr?.reviewDecision ?? null,
+        // Still "how many are in flight", which is what the card's ⚙n means and
+        // what the web board's chips count. The list below is a different
+        // question and deliberately a different field.
         agentCount: s.agents.length,
         lastActivity: s.lastActivity,
         ageSeconds: s.ageSeconds,
+
+        // --- Session detail panel (long-press on the Pi) ---
+        // Flattened per the rule above: scalars only, never the facet objects.
+        repo: s.project?.repo ?? null,
+        base: s.project?.base ?? null,
+        worktree: s.project?.worktree ?? false,
+        prIsDraft: s.pr?.isDraft ?? false,
+        effort: s.effort ?? null,
+        permissionMode: s.permissionMode ?? null,
+        planName: s.plan?.name ?? null,
+        // `running` and `seconds` are computed HERE, from the Mac's own clock,
+        // so the Pi gets numbers rather than timestamps it would have to
+        // reconcile against a clock that may not agree with this one.
+        agents: (s.agentRuns ?? []).map((a) => ({
+          label: a.label,
+          agentType: a.agentType,
+          model: a.model,
+          running: a.endedAt === null,
+          seconds: agentSeconds(a),
+          failed: a.failed === true,
+        })),
       })),
     };
     try {

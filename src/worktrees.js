@@ -18,11 +18,12 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs";
+import path from "node:path";
 import { config } from "./config.js";
 
 const execFileP = promisify(execFile);
 
-/** cwd -> { isWorktree, exists, repos } */
+/** cwd -> { isWorktree, exists, repos, nestedRepos } */
 const cache = new Map();
 let checkedAt = 0;
 let inFlight = null;
@@ -33,7 +34,27 @@ let inFlight = null;
  * worktree" rather than to an error.
  */
 export function worktreeInfo(cwd) {
-  return cache.get(cwd) ?? { isWorktree: false, exists: true, repos: [] };
+  return cache.get(cwd) ?? { isWorktree: false, exists: true, repos: [], nestedRepos: [] };
+}
+
+/**
+ * Every repo this directory could plausibly be working in: its own remotes, or
+ * — when it has none of its own — the remotes of the repos sitting directly
+ * inside it.
+ *
+ * A session is often pointed at a FOLDER OF REPOS rather than at a repo:
+ * `~/Developer/LaminarFlow` holds Backend, Frontend and a wiki, and the work
+ * happens in one of them. Such a directory has no remote of its own, so
+ * anything asking "which repo is this session in?" gets nothing back — which is
+ * exactly the case that leaves a PR undiscovered.
+ *
+ * A pure cache read, like `worktreeInfo`. One level deep only: this is for
+ * "a folder I keep my repos in", not a filesystem crawl.
+ */
+export function candidateRepos(cwd) {
+  const entry = cache.get(cwd);
+  if (!entry) return [];
+  return entry.repos.length ? entry.repos : entry.nestedRepos;
 }
 
 /**
@@ -88,7 +109,7 @@ export function refreshWorktrees(cwds) {
       try {
         if (!fs.existsSync(cwd)) {
           // A deleted worktree: the session's directory is simply gone.
-          cache.set(cwd, { isWorktree: false, exists: false, repos: [] });
+          cache.set(cwd, { isWorktree: false, exists: false, repos: [], nestedRepos: [] });
           continue;
         }
         // A linked worktree's own git dir differs from the repo's common one;
@@ -98,15 +119,28 @@ export function refreshWorktrees(cwds) {
           git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"),
           git(cwd, "remote", "-v").catch(() => ""),
         ]);
+        const repos = parseRemotes(origin);
         cache.set(cwd, {
           isWorktree: Boolean(gitDir && commonDir && gitDir !== commonDir),
           exists: true,
-          repos: parseRemotes(origin),
+          repos,
+          // Only when the directory is not itself a checkout. A repo's
+          // subdirectories are its own source tree, not sibling projects.
+          nestedRepos: repos.length ? [] : await nestedReposIn(cwd),
         });
       } catch {
-        // Not a repo, or git unavailable. Keeping any previous answer beats
-        // clearing one on a transient failure.
-        if (!cache.has(cwd)) cache.set(cwd, { isWorktree: false, exists: true, repos: [] });
+        // Not a repo, or git unavailable. A directory that is not a checkout is
+        // the interesting case rather than a failure — it may be a folder of
+        // repos, so still look inside before giving up on it.
+        if (!cache.has(cwd)) {
+          let nestedRepos = [];
+          try {
+            nestedRepos = await nestedReposIn(cwd);
+          } catch {
+            /* unreadable directory */
+          }
+          cache.set(cwd, { isWorktree: false, exists: true, repos: [], nestedRepos });
+        }
       }
     }
     inFlight = null;
@@ -114,6 +148,39 @@ export function refreshWorktrees(cwds) {
   inFlight.catch(() => {
     inFlight = null;
   });
+}
+
+/**
+ * Remotes of every git repo sitting directly inside `dir`.
+ *
+ * Capped, because this runs `git` once per child: a directory with a hundred
+ * entries is not the folder-of-repos this exists for, and should not cost a
+ * hundred processes to find that out.
+ */
+const MAX_NESTED_PROBES = 12;
+
+async function nestedReposIn(dir) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const children = entries
+    .filter((e) => e.isDirectory() && !e.name.startsWith("."))
+    .slice(0, MAX_NESTED_PROBES)
+    .map((e) => path.join(dir, e.name))
+    .filter((p) => fs.existsSync(path.join(p, ".git")));
+
+  const found = new Set();
+  for (const child of children) {
+    try {
+      for (const repo of parseRemotes(await git(child, "remote", "-v"))) found.add(repo);
+    } catch {
+      /* not a usable checkout */
+    }
+  }
+  return [...found];
 }
 
 async function git(cwd, ...args) {
